@@ -1,0 +1,9 @@
+# 영상 데이터와 결과물: 업로드 금지
+*.nii
+*.nii.gz
+*.dcm
+data/
+outputs/
+# 기타
+__pycache__/
+.DS_Store
