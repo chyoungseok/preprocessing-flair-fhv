@@ -23,15 +23,43 @@ python -m modules.pipeline \
 | Bias correction | SimpleITK N4, brain mask 안에서 추정 | in-plane 4배 축소 `(4,4,1)`에서 추정 후 원해상도에 적용, 반복 `(50,50,30,20)` |
 | Masking | 보정 영상 × brain mask | — |
 | Orientation | nibabel 축 재배열(보간 없음) | LAS |
-| Normalization | 슬라이스별 전체 화소 1–99 백분위수 min-max, [0,1] clip | `slice_p1_p99` |
-| Size | 확대는 `cv2.INTER_LINEAR`, 축소는 `cv2.INTER_AREA`. z축은 그대로 | `resize`, 512×512 |
+| Normalization | 뇌 마스크 안 voxel의 **볼륨 전체** 0.5–99.5 백분위수로 min-max, [0,1] clip, 마스크 밖 0 | `volume_brain_p05_p995` |
+| Size | in-plane을 **0.41 mm/px로 리샘플링**(확대 `INTER_LINEAR`, 축소 `INTER_AREA`)한 뒤 512에 맞춤. 512보다 작으면 중앙 pad, 크면 뇌 중심 기준 crop. z축은 그대로 | `fixed_spacing_pad`, 512×512 |
 | PNG | `flipud(slice.T)`, `round(x*255)` 8-bit grayscale | `<case_id>__slice_0001.png` (1-based) |
 
-이 기본값은 기존 YOLO 학습 데이터(2026-08-13 PAIK 실행, `09_FHV/yolo/00_preproc_pipeline`)와 같다. PAIK 6 case로 검증한 결과는 다음과 같다.
+### 2026-10-29 기본값 변경 (정규화·크기)
 
-- SynthStrip 마스크는 기존 마스크와 voxel 단위로 완전히 같다.
-- N4를 원해상도로 돌리면 PNG도 기존과 픽셀이 완전히 같다.
-- 기본값인 `(4,4,1)` 축소에서는 평균 0.05–0.09 계조, 최대 5 계조(0–255) 차이가 난다.
+기존 YOLO 학습 데이터(2026-08-13 PAIK 실행)와 **PNG가 다르다.** 그래서 YOLO를 다시 학습해야 하고, 기존 GT 박스도 좌표를 변환해야 한다(아래 "GT 박스 변환").
+
+- **정규화:** 예전 방식은 슬라이스마다 배경 0까지 섞어 백분위수를 계산했다. 그래서 뇌가 작은 슬라이스는 대비가 과하게 커지고, 밝은 FHV가 포화됐다.
+  - 예시 scan의 FHV 박스 안 255 화소 비율: 예전 0.81%(최대 4.5%), 새 방식 0.03%(최대 0.25%).
+  - 상한을 99.9%로 올리면 포화는 0이 되지만 박스 평균 밝기가 108에서 91로 떨어져 대비가 줄어든다.
+- **크기:** 예전 방식은 모든 슬라이스를 512로 늘렸으므로 픽셀 간격이 FOV/512였다.
+  - PAIK은 FOV가 200–220 mm로 거의 같아서 차이가 작았다(1–99% 구간 1.10배, 최대 1.26배).
+  - 대신 정사각형이 아닌 matrix(372×384, 58건)는 가로가 3% 늘어났다.
+  - 새 방식은 FOV와 matrix에 관계없이 같은 mm가 같은 px이다. 0.41 mm는 PAIK FOV 중앙값 210 mm ÷ 512이고, 512 px는 210 mm를 덮는다.
+  - FOV 210 mm인 scan(PAIK의 대부분)은 geometry가 예전과 같다.
+- **예전 데이터 재현:** `--normalization legacy_slice_p1_p99 --size-policy legacy_resize`. 이렇게 돌리면 예전 기본값 결과와 PNG가 완전히 같다(6 case, 144장 확인). SynthStrip 마스크는 예전 마스크와 voxel 단위로 같고, 예전 PNG와의 차이는 N4 `(4,4,1)` 축소에서 오는 평균 0.05–0.09 계조뿐이다.
+
+## GT 박스 변환
+
+각 케이스의 `case.json`에 있는 `geometry`가 voxel 좌표와 캔버스 좌표의 관계를 기록한다.
+
+- `resampled_xy`: 리샘플링한 크기
+- `offset_xy`: 캔버스에 놓은 위치(음수는 crop)
+- `brain_cropped`: crop하다가 뇌가 잘렸는지
+
+예전 PNG(LAS, 512로 늘림)에 그린 YOLO 라벨은 다음 명령으로 새 PNG 좌표로 옮긴다.
+
+```bash
+python -m modules.convert_labels \
+  --labels-dir /Users/yschoi/code/09_FHV/yolo/FHV_bbox_full_v1/labels/train/images \
+  --png-dir <pipeline --out-dir> \
+  --dest <새 빈 폴더>
+```
+
+- 캔버스 밖으로 잘린 박스는 `conversion_report.csv`에 기록된다.
+- 검증 결과: 왕복 변환 오차는 1e-15 수준이다. FOV 240 mm와 372×384 케이스 46개 박스를 겹쳐 그려 보니 같은 FHV 위치에 놓였다.
 
 ## SynthStrip 백엔드
 
@@ -82,9 +110,9 @@ python -m modules.pipeline \
 
 ## 다른 설정을 추가하는 방법
 
-현재는 각 단계에 정책이 하나씩만 구현되어 있다. 정책을 추가하려면 `modules/preprocess.py`에서 해당 레지스트리에 함수를 등록한다. 그러면 `pipeline.py`의 CLI 선택지에 자동으로 나타난다.
+정책을 추가하려면 `modules/preprocess.py`에서 해당 레지스트리에 함수를 등록한다. 그러면 `pipeline.py`의 CLI 선택지에 자동으로 나타난다. 정규화와 크기의 `legacy_*` 정책은 예전 데이터를 재현하는 용도다.
 
 - 방향: `ORIENTATIONS`에 `"RAS"` 추가(`reorient()`는 임의 축 코드를 처리한다)
-- 정규화: `NORMALIZATION_POLICIES`
-- 크기: `SIZE_POLICIES` (예: 고정 spacing으로 리샘플링한 뒤 pad)
-- Skull stripping: `SKULLSTRIP_BACKENDS` (예: 네이티브 PyTorch SynthStrip)
+- 정규화: `NORMALIZATION_POLICIES`. `(volume, mask) -> [0,1] volume`
+- 크기: `SIZE_POLICIES`. `(volume, mask, zooms_xy, size) -> (canvas volume, geometry)`
+- Skull stripping: `SKULLSTRIP_BACKENDS`

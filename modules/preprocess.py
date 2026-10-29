@@ -162,33 +162,153 @@ ORIENTATIONS = ("LAS",)
 
 
 # ---------------------------------------------------------------------------
-# Step 5. Slice normalization, in-plane size, PNG pixels
+# Step 5. Intensity normalization, in-plane size, PNG pixels
+#
+# Both policies take the whole reoriented (X, Y, Z) volume. Size policies also
+# return a geometry dict that places the resampled grid on the square canvas:
+# canvas x = voxel x * resampled_xy[0] / shape_xy[0] + offset_xy[0] (same for y).
+# ``convert_box`` uses it to move YOLO boxes between two geometries.
 # ---------------------------------------------------------------------------
 
-def normalize_slice_p1_p99(slice2d: np.ndarray) -> np.ndarray:
-    """Per-slice min-max between the 1st/99th percentile of all pixels, clipped to [0, 1]."""
-    slice2d = slice2d.astype(np.float32, copy=False)
-    vmin, vmax = np.percentile(slice2d, (1, 99))
+def normalize_volume_brain_p05_p995(volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Min-max between the 0.5/99.5 percentiles of brain-mask voxels of the whole volume; outside mask = 0.
+
+    One range per scan keeps contrast consistent across slices, and the 99.5 cap leaves
+    the brightest structures (FHV) mostly unsaturated (example scan: 0.03% vs 0.81% of
+    FHV-box pixels at 255 with the legacy per-slice 1-99 policy).
+    """
+    brain = volume[mask]
+    if brain.size == 0:
+        return np.zeros(volume.shape, dtype=np.float32)
+    vmin, vmax = np.percentile(brain, (0.5, 99.5))
     if vmax <= vmin:
-        return np.zeros_like(slice2d, dtype=np.float32)
-    return np.clip((slice2d - vmin) / (vmax - vmin), 0, 1).astype(np.float32, copy=False)
+        return np.zeros(volume.shape, dtype=np.float32)
+    return (np.clip((volume - vmin) / (vmax - vmin), 0, 1) * mask).astype(np.float32)
 
 
-NORMALIZATION_POLICIES = {"slice_p1_p99": normalize_slice_p1_p99}
+def normalize_legacy_slice_p1_p99(volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Legacy (2026-08-13 PAIK YOLO data): per slice, 1/99 percentiles of all pixels incl. background."""
+    out = np.zeros(volume.shape, dtype=np.float32)
+    for z in range(volume.shape[2]):
+        sl = volume[:, :, z].astype(np.float32, copy=False)
+        vmin, vmax = np.percentile(sl, (1, 99))
+        if vmax > vmin:
+            out[:, :, z] = np.clip((sl - vmin) / (vmax - vmin), 0, 1)
+    return out
 
 
-def resize_square(slice2d: np.ndarray, size: int) -> np.ndarray:
-    """Resize to ``size x size``: bilinear when enlarging, area averaging when shrinking."""
+NORMALIZATION_POLICIES = {
+    "volume_brain_p05_p995": normalize_volume_brain_p05_p995,
+    "legacy_slice_p1_p99": normalize_legacy_slice_p1_p99,
+}
+
+
+# PAIK median FOV 210 mm / 512 px. 512 px then covers 210 mm, larger than an adult brain.
+TARGET_SPACING_MM = 0.41
+
+
+def _resample_slices(volume: np.ndarray, shape_xy: tuple[int, int], interpolation=None) -> np.ndarray:
+    """Resample each (X, Y) slice to ``shape_xy``; area averaging only when shrinking both axes."""
     import cv2
 
-    if slice2d.shape == (size, size):
-        return slice2d
-    shrinking = slice2d.shape[0] > size or slice2d.shape[1] > size
-    interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
-    return cv2.resize(slice2d, (size, size), interpolation=interpolation)
+    nx, ny = volume.shape[:2]
+    wx, hy = shape_xy
+    if (wx, hy) == (nx, ny):
+        return volume
+    if interpolation is None:
+        shrinking = wx <= nx and hy <= ny
+        interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+    # Slices are (X rows, Y cols); cv2 dsize is (cols, rows).
+    return np.stack([cv2.resize(volume[:, :, z], (hy, wx), interpolation=interpolation)
+                     for z in range(volume.shape[2])], axis=2)
 
 
-SIZE_POLICIES = {"resize": resize_square}
+def _canvas_offset(n_resampled: int, size: int, brain_lo: float, brain_hi: float) -> int:
+    """Center the image if it fits; otherwise center the brain and crop, never past the image edge."""
+    if n_resampled <= size:
+        return (size - n_resampled) // 2
+    offset = int(round(size / 2 - (brain_lo + brain_hi) / 2))
+    return min(0, max(size - n_resampled, offset))
+
+
+def _place_on_canvas(volume: np.ndarray, offset_xy: tuple[int, int], size: int) -> np.ndarray:
+    canvas = np.zeros((size, size, volume.shape[2]), dtype=np.float32)
+    (ox, oy), (wx, hy) = offset_xy, volume.shape[:2]
+    cx0, cy0 = max(0, ox), max(0, oy)
+    cx1, cy1 = min(size, ox + wx), min(size, oy + hy)
+    canvas[cx0:cx1, cy0:cy1] = volume[cx0 - ox:cx1 - ox, cy0 - oy:cy1 - oy]
+    return canvas
+
+
+def size_fixed_spacing_pad(volume: np.ndarray, mask: np.ndarray, zooms_xy, size: int):
+    """Resample in-plane to TARGET_SPACING_MM, then center-pad (or brain-centered crop) to ``size``."""
+    import cv2
+
+    nx, ny = volume.shape[:2]
+    shape_xy = (int(round(nx * zooms_xy[0] / TARGET_SPACING_MM)), int(round(ny * zooms_xy[1] / TARGET_SPACING_MM)))
+    resampled = _resample_slices(volume, shape_xy)
+    mask_resampled = _resample_slices(mask.astype(np.uint8), shape_xy, cv2.INTER_NEAREST) > 0
+
+    offset, cropped = [], False
+    for axis, n in enumerate(shape_xy):
+        other = tuple(a for a in (0, 1, 2) if a != axis)
+        idx = np.flatnonzero(mask_resampled.any(axis=other))
+        lo, hi = (idx[0], idx[-1] + 1) if idx.size else (0, n)
+        o = _canvas_offset(n, size, lo, hi)
+        offset.append(o)
+        cropped |= lo + o < 0 or hi + o > size
+    geometry = {
+        "shape_xy": [nx, ny],
+        "zooms_xy": [float(zooms_xy[0]), float(zooms_xy[1])],
+        "resampled_xy": list(shape_xy),
+        "offset_xy": offset,
+        "canvas": size,
+        "brain_cropped": bool(cropped),
+    }
+    return _place_on_canvas(resampled, tuple(offset), size), geometry
+
+
+def size_legacy_resize(volume: np.ndarray, mask: np.ndarray, zooms_xy, size: int):
+    """Legacy (2026-08-13 PAIK YOLO data): stretch every slice to ``size x size`` (pixel = FOV / size)."""
+    nx, ny = volume.shape[:2]
+    geometry = {
+        "shape_xy": [nx, ny],
+        "zooms_xy": [float(zooms_xy[0]), float(zooms_xy[1])],
+        "resampled_xy": [size, size],
+        "offset_xy": [0, 0],
+        "canvas": size,
+        "brain_cropped": False,
+    }
+    return _resample_slices(volume, (size, size)), geometry
+
+
+SIZE_POLICIES = {
+    "fixed_spacing_pad": size_fixed_spacing_pad,
+    "legacy_resize": size_legacy_resize,
+}
+
+
+def convert_box(box_cxcywh, geometry_from: dict, geometry_to: dict):
+    """Move a YOLO box (normalized cx, cy, w, h on the PNG) between two geometries of the same scan.
+
+    PNG column u = canvas x; PNG row v = canvas - canvas y (``flipud`` of the transposed slice).
+    Returns the box clipped to the target canvas, or None when nothing remains inside.
+    """
+    cx, cy, w, h = box_cxcywh
+    c_from, c_to = geometry_from["canvas"], geometry_to["canvas"]
+    corners = []
+    for u, v in ((cx - w / 2, cy - h / 2), (cx + w / 2, cy + h / 2)):
+        xy = (u * c_from, c_from - v * c_from)
+        voxel = [(p - geometry_from["offset_xy"][i]) * geometry_from["shape_xy"][i] / geometry_from["resampled_xy"][i]
+                 for i, p in enumerate(xy)]
+        x_to, y_to = [voxel[i] * geometry_to["resampled_xy"][i] / geometry_to["shape_xy"][i] + geometry_to["offset_xy"][i]
+                      for i in range(2)]
+        corners.append((np.clip(x_to, 0, c_to), np.clip(c_to - y_to, 0, c_to)))
+    (u0, v0), (u1, v1) = corners
+    u0, u1, v0, v1 = min(u0, u1), max(u0, u1), min(v0, v1), max(v0, v1)
+    if u1 - u0 <= 0 or v1 - v0 <= 0:
+        return None
+    return ((u0 + u1) / 2 / c_to, (v0 + v1) / 2 / c_to, (u1 - u0) / c_to, (v1 - v0) / c_to)
 
 
 def to_png_pixels(slice_xy: np.ndarray) -> np.ndarray:

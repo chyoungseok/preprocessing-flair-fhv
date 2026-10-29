@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - 코호트: 내부 UHK(GT 버전 full-v1, UHK70, UHK100 — 현재 주 연구는 UHK100), 외부 Guri2025, PAIK
 - DICOM → NIfTI 변환은 이 저장소에 없다(도구 미확인).
-- 기존 YOLO 학습 데이터는 `/Users/yschoi/code/09_FHV/yolo/00_preproc_pipeline`(2026-08-13 PAIK 실행)이 만들었다. 이 저장소의 기본값은 그 데이터와 같은 결과를 내도록 맞춰져 있다.
+- 기존 YOLO 학습 데이터는 `/Users/yschoi/code/09_FHV/yolo/00_preproc_pipeline`(2026-08-13 PAIK 실행)이 만들었다. 2026-10-29부터 정규화와 크기의 기본값이 바뀌어서, 새 PNG는 그 데이터와 다르다(재학습과 GT 박스 변환 필요). `legacy_*` 정책으로 돌리면 그 데이터를 재현할 수 있다.
 
 ## 실행
 
@@ -26,12 +26,14 @@ python -m modules.pipeline ... --pid BP00013_P17914 --workers 1   # 한 케이�
 ## 아키텍처
 
 - `modules/pipeline.py`: CLI, 케이스 탐색, 라벨 매칭, 케이스 단위 병렬 처리(`ProcessPoolExecutor`), PNG/manifest/QC/메타데이터 쓰기.
-- `modules/preprocess.py`: 단계별 연산. SynthStrip(native MPS 또는 Docker) → N4 → mask → 방향 정렬 → 슬라이스 정규화 → 크기 맞춤 → PNG 픽셀.
+- `modules/preprocess.py`: 단계별 연산. SynthStrip(native MPS 또는 Docker) → N4 → mask → 방향 정렬 → 볼륨 정규화 → 크기 맞춤(geometry 반환) → PNG 픽셀. `convert_box`는 두 geometry 사이에서 YOLO 박스를 옮긴다.
+- `modules/convert_labels.py`: 예전 PNG(512로 늘림)에 그린 YOLO 라벨을 출력 폴더의 `case.json` geometry로 변환하는 CLI.
 - `modules/labels.py`: 라벨 표를 `{case_id: CaseLabel}`로 읽는다. 표에 scan 열이 있으면 `case_id`는 `id_subject_id_scan`(또는 `id_session`)이고, 없으면 `id_subject`다.
 
 핵심 설계:
 
-- **단계마다 정책이 하나뿐이다.** 선택지는 `preprocess.py`의 레지스트리(`ORIENTATIONS`, `NORMALIZATION_POLICIES`, `SIZE_POLICIES`, `SKULLSTRIP_BACKENDS`)에 하나씩만 등록되어 있다. 사용자가 원할 때만 항목을 추가한다. 기본값을 바꾸거나 추가하기 전에 사용자 확인을 받는다.
+- **정책은 최소한으로 둔다.** 선택지는 `preprocess.py`의 레지스트리(`ORIENTATIONS`, `NORMALIZATION_POLICIES`, `SIZE_POLICIES`, `SKULLSTRIP_BACKENDS`)에 있다. 기본값 외에는 예전 데이터를 재현하는 `legacy_*`와 `docker` 백엔드만 있다. 사용자가 원할 때만 항목을 추가하고, 기본값을 바꾸거나 추가하기 전에 사용자 확인을 받는다.
+- 정규화와 크기 정책은 볼륨 전체를 받는다. 크기 정책은 `geometry`(`shape_xy`, `zooms_xy`, `resampled_xy`, `offset_xy`, `canvas`, `brain_cropped`)를 함께 돌려주고, 이 값은 `case.json`에 기록된다. PNG 좌표를 바꾸는 변경은 반드시 geometry에 반영해야 GT 박스 변환이 맞는다.
 - **케이스 하나를 메모리에서 끝까지 처리한다.** 디스크에 남는 중간 파일은 SynthStrip의 brain/mask뿐이고, 재실행할 때 이 파일을 재사용한다.
 - `cases/<case_id>/case.json`이 완료 표시다. manifest는 매 실행 끝에 모든 `case.json`에서 다시 만든다.
 - `run_metadata.json`의 `settings`가 출력 폴더의 설정이다. 다른 설정이나 다른 도구가 만든 폴더에는 쓰기를 거부한다(`check_output_dir`).
@@ -40,17 +42,19 @@ python -m modules.pipeline ... --pid BP00013_P17914 --workers 1   # 한 케이�
 
 기존 데이터와의 관계:
 
-- 기본값은 LAS, 슬라이스별 전체 화소 1–99 백분위수 정규화, 512 resize, 8-bit PNG다.
+- 기본값:
+  - LAS
+  - 뇌 마스크 기준 볼륨 0.5–99.5 백분위수 정규화(`volume_brain_p05_p995`)
+  - 0.41 mm/px 리샘플링 후 512 pad, 512보다 크면 뇌 중심 crop(`fixed_spacing_pad`)
+  - 8-bit PNG
+- 예전 데이터(2026-08-13)는 `--normalization legacy_slice_p1_p99 --size-policy legacy_resize`로 재현한다.
 - 새 코드로 Docker SynthStrip을 돌린 마스크는 기존 마스크와 voxel 단위로 같다.
-- N4 `N4_SHRINK_XYZ=(1,1,1)`로 돌리면 기존 PNG와 픽셀이 완전히 같다(PAIK 6 case 실측). 기본값 `(4,4,1)`은 약 10배 빠르고 평균 0.05–0.09 계조 차이가 난다.
+- 예전 정책에서 N4 `N4_SHRINK_XYZ=(1,1,1)`로 돌리면 기존 PNG와 픽셀이 완전히 같다(PAIK 6 case 실측). 기본값 `(4,4,1)`은 약 10배 빠르고 평균 0.05–0.09 계조 차이가 난다.
+- PAIK은 FOV가 200–220 mm로 거의 같아서, 대부분 scan(FOV 210 mm)의 geometry는 예전과 같다. FOV가 다르거나 정사각형이 아닌 scan만 좌표가 바뀐다.
 - SynthStrip 동시 실행 수는 프로세스 간 semaphore로 제한한다. Docker는 메모리 / 6 GiB(`docker_parallel_slots`), native는 2개다.
 - `native` 백엔드는 Docker 이미지의 `mri_synthstrip`과 가중치를 `~/.cache/fhv_preproc/synthstrip/`에 꺼내고 장치만 MPS로 바꿔 실행한다. 마스크는 Docker와 voxel 1개 이내로 같고 약 4배 빠르다. arm64 CPU PyTorch로 돌리면 Conv3d가 40 GB 이상을 써서 죽는다. FreeSurfer 코드는 저장소에 커밋하지 않는다. PyPI의 surfa 0.6.x는 numpy 2에서 실패하므로 surfa는 master 커밋으로 고정했다.
 - 라벨은 **슬라이스 단위 양성 여부**(1-based `fhv_slice_num`)이며 YOLO bounding box GT와 다르다.
-- 알려진 위험(선행연구 검토, 미적용):
-  - 정규화에 마스크 밖의 0이 섞이고, 슬라이스 단위라 밝은 FHV가 99%에서 포화될 수 있다.
-  - in-plane spacing을 통일하지 않아 FHV 크기가 스캐너마다 다르게 보인다.
-  - SynthStrip 마스크가 피질 표면의 FHV를 자를 수 있다.
-  - 바꾸면 기존 학습 데이터와 분포가 달라진다.
+- 남은 위험(미적용): SynthStrip 기본 경계(`-b 1`)가 피질 표면의 FHV를 자를 수 있다. 예시 1 scan에서 FHV 박스 12개 중 5개가 박스 면적의 10% 이상 마스크 밖이었고, `-b 3`에서는 최대 9%였다. 전체 GT 박스로 측정한 뒤 결정한다.
 - 이전 단계별 스크립트(step0–7, H5/MIL, GradCAM 역변환 등)는 커밋 `e3cabae`에 있다.
 
 ## 작업 규칙

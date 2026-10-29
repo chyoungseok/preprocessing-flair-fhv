@@ -1,7 +1,9 @@
 """FLAIR NIfTI -> YOLO PNG preprocessing pipeline.
 
 Per case: SynthStrip -> N4 (in brain mask) -> mask -> reorient (LAS) ->
-per-slice 1-99 percentile normalization -> 512x512 resize -> 8-bit PNG.
+brain-mask volume 0.5-99.5 percentile normalization -> in-plane resample to
+0.41 mm and pad/crop to 512x512 -> 8-bit PNG. ``cases/<id>/case.json`` keeps the
+canvas geometry; ``modules.convert_labels`` moves YOLO boxes between geometries.
 
 Output layout (``--out-dir``)::
 
@@ -54,7 +56,7 @@ MANIFEST_COLUMNS = (
 # Settings that change pixel values; resuming into an output made with other values is refused.
 SETTING_KEYS = (
     "skullstrip_backend", "synthstrip_image", "orientation", "normalization",
-    "size_policy", "target_size", "label_column",
+    "size_policy", "target_size", "target_spacing_mm", "label_column",
 )
 
 
@@ -143,21 +145,23 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
     corrected *= mask
     source = nib.load(str(input_path))
     affine = source.affine
-    volume, _ = pp.reorient(corrected, affine, settings["orientation"])
+    volume, oriented_affine = pp.reorient(corrected, affine, settings["orientation"])
+    mask_oriented, _ = pp.reorient(mask, affine, settings["orientation"])
+    zooms_xy = np.sqrt((oriented_affine[:3, :2] ** 2).sum(axis=0))
     n_slices = volume.shape[2]
     positives = set(label.positive_slices_1based)
     out_of_range = sorted(z for z in positives if z > n_slices)
     if out_of_range:
         raise ValueError(f"label slices {out_of_range} exceed slice count {n_slices}")
 
-    normalize = pp.NORMALIZATION_POLICIES[settings["normalization"]]
-    standardize_size = pp.SIZE_POLICIES[settings["size_policy"]]
+    normalized = pp.NORMALIZATION_POLICIES[settings["normalization"]](volume, mask_oriented)
+    canvas, geometry = pp.SIZE_POLICIES[settings["size_policy"]](normalized, mask_oriented, zooms_xy, settings["target_size"])
     rows = []
     pixels_by_z = {}
     for z in range(n_slices):
         slice_1based = z + 1
         cls = int(slice_1based in positives)
-        pixels = pp.to_png_pixels(standardize_size(normalize(volume[:, :, z]), settings["target_size"]))
+        pixels = pp.to_png_pixels(canvas[:, :, z])
         filename = f"{case_id}__slice_{slice_1based:04d}.png"
         relative = Path(CLASS_DIRS[cls]) / "images" / filename
         # A label edit between runs can move a slice to the other class folder.
@@ -180,7 +184,6 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
     if qc:
         qc_z = min(positives) - 1 if positives else n_slices // 2
         raw, _ = pp.reorient(np.asanyarray(source.dataobj, dtype=np.float32), affine, settings["orientation"])
-        mask_oriented, _ = pp.reorient(mask, affine, settings["orientation"])
         save_qc(case_dir / f"{case_id}_qc.png", raw, mask_oriented, volume, pixels_by_z[qc_z], qc_z,
                 f"{case_id}  slice {qc_z + 1}/{n_slices}  {'FHV+' if positives else ''}")
 
@@ -191,6 +194,7 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
         "axcodes_output": settings["orientation"],
         "n_slices": n_slices,
         "n_positive": len(positives),
+        "geometry": geometry,
         "settings": {key: settings[key] for key in SETTING_KEYS},
         "rows": rows,
     }
@@ -267,6 +271,7 @@ def run(args: argparse.Namespace) -> int:
         "normalization": args.normalization,
         "size_policy": args.size_policy,
         "target_size": args.target_size,
+        "target_spacing_mm": pp.TARGET_SPACING_MM,
         "label_column": args.label_column,
     }
     check_output_dir(out_dir, settings, args.overwrite)
@@ -394,8 +399,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "Default: $FHV_SYNTHSTRIP_PYTHON, else the sibling conda env 'fhv_synthstrip'.")
     parser.add_argument("--platform", default="linux/amd64", help="Docker --platform; the SynthStrip image is amd64-only.")
     parser.add_argument("--orientation", choices=pp.ORIENTATIONS, default="LAS")
-    parser.add_argument("--normalization", choices=sorted(pp.NORMALIZATION_POLICIES), default="slice_p1_p99")
-    parser.add_argument("--size-policy", choices=sorted(pp.SIZE_POLICIES), default="resize")
+    parser.add_argument("--normalization", choices=sorted(pp.NORMALIZATION_POLICIES), default="volume_brain_p05_p995",
+                        help="legacy_slice_p1_p99 reproduces the 2026-08-13 PAIK YOLO data.")
+    parser.add_argument("--size-policy", choices=sorted(pp.SIZE_POLICIES), default="fixed_spacing_pad",
+                        help=f"fixed_spacing_pad: {pp.TARGET_SPACING_MM} mm/px, then pad/crop; legacy_resize: stretch to size.")
     parser.add_argument("--target-size", type=int, default=512)
     return parser
 
