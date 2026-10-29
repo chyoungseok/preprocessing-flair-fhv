@@ -4,7 +4,8 @@
 
 ```bash
 conda activate flair_preproc   # nibabel, SimpleITK, opencv, pandas, openpyxl, matplotlib
-# Docker Desktop 실행 필요 (SynthStrip)
+# SynthStrip(native): 같은 conda 아래 fhv_synthstrip 환경이 필요하다 (아래 "SynthStrip 백엔드").
+# 처음 한 번은 Docker Desktop이 켜져 있어야 한다 (이미지에서 스크립트·가중치를 복사).
 
 python -m modules.pipeline \
   --src-dir /Volumes/GURI_1/FLAIR_PAIK_nii \
@@ -18,7 +19,7 @@ python -m modules.pipeline \
 
 | 단계 | 구현 | 기본값 |
 |---|---|---|
-| Skull stripping | Docker SynthStrip, 기본 마스크(뇌 주변 CSF 포함) | `freesurfer/synthstrip:latest`, `--platform linux/amd64` |
+| Skull stripping | SynthStrip v1 가중치, 기본 마스크(뇌 주변 CSF 포함) | `native`(Apple GPU), `freesurfer/synthstrip:latest`에서 복사 |
 | Bias correction | SimpleITK N4, brain mask 안에서 추정 | in-plane 4배 축소 `(4,4,1)`에서 추정 후 원해상도에 적용, 반복 `(50,50,30,20)` |
 | Masking | 보정 영상 × brain mask | — |
 | Orientation | nibabel 축 재배열(보간 없음) | LAS |
@@ -32,13 +33,33 @@ python -m modules.pipeline \
 - N4를 원해상도로 돌리면 PNG도 기존과 픽셀이 완전히 같다.
 - 기본값인 `(4,4,1)` 축소에서는 평균 0.05–0.09 계조, 최대 5 계조(0–255) 차이가 난다.
 
+## SynthStrip 백엔드
+
+| `--skullstrip-backend` | 방식 | 케이스당 시간 (6 case, `--workers 4`) |
+|---|---|---|
+| `native` (기본) | Docker 이미지에서 꺼낸 `mri_synthstrip`과 가중치를 Apple GPU(MPS)에서 실행 | 약 2.5초 |
+| `docker` | amd64 이미지를 에뮬레이션으로 실행 | 약 10초 |
+
+`native` 백엔드는 다음과 같이 동작한다.
+
+- 처음 실행할 때 한 번만 Docker 이미지에서 스크립트와 가중치를 `~/.cache/fhv_preproc/synthstrip/<image>/`로 복사한다. 이때 장치 한 줄만 `cpu`에서 `mps`로 바꾼다. 그 이후에는 Docker가 필요 없다.
+- PyTorch(MPS에서 Conv3d 지원, 2.1.2는 미지원)와 surfa가 설치된 Python이 필요하다. 기본값은 같은 conda 아래의 `fhv_synthstrip` 환경이고, `--synthstrip-python` 또는 `FHV_SYNTHSTRIP_PYTHON`으로 바꿀 수 있다. 환경은 다음과 같이 만든다.
+
+  ```bash
+  conda create -n fhv_synthstrip python=3.12
+  /opt/anaconda3/envs/fhv_synthstrip/bin/pip install -r requirements-synthstrip.txt
+  ```
+- arm64 CPU로 돌리면 PyTorch가 Conv3d에 40 GB 이상을 써서 프로세스가 죽는다. 그래서 MPS만 쓴다.
+- PAIK 6 case에서 마스크가 Docker와 비교해 5 case는 완전히 같았고, 1 case는 voxel 1개만 달랐다.
+
 ## 속도와 병렬 처리
 
-- `--workers`(기본 4)개 케이스를 병렬로 처리한다.
-- SynthStrip 컨테이너 하나는 메모리를 최대 약 5.6 GiB 쓴다. 그래서 동시에 띄우는 컨테이너 수는 Docker 메모리 / 6 GiB로 자동 제한된다(16 GB이면 2개). 이를 넘으면 컨테이너가 OOM으로 죽는다(exit 137).
-- SynthStrip은 amd64 이미지를 에뮬레이션으로 돌리므로 시간 대부분을 차지한다. M4 Pro, Docker 16 GB 기준 측정값:
-  - 순차 실행: 케이스당 약 14초
-  - `--workers 4`: 케이스당 약 10초
+- `--workers`(기본 4)개 케이스를 병렬로 처리한다. SynthStrip만 동시 실행 수를 따로 제한한다.
+  - `native`: 2개. 4개로 늘려도 거의 빨라지지 않았다.
+  - `docker`: Docker 메모리 / 6 GiB개(16 GB이면 2개). 컨테이너 하나가 최대 약 5.6 GiB를 쓰므로, 이를 넘으면 OOM으로 죽는다(exit 137).
+- M4 Pro 기준 측정값(6 case, `--workers 4`):
+  - `native`: 케이스당 약 2.5–3초
+  - `docker`: 케이스당 약 10초
   - SynthStrip 결과가 이미 있을 때(N4 이후만): 케이스당 약 1.7초
 
 ## 출력
@@ -55,7 +76,7 @@ python -m modules.pipeline \
 
 - 라벨 표에 없는 입력(`unlabeled`)은 처리하지 않는다. 음성으로 간주하지 않는다.
 - `case_id`는 입력 파일명에서 `_FLAIR` 앞부분이다. 라벨 표에서는 `<id_subject>_<id_scan|id_session>` 또는 `id_subject`로 만든다.
-- `cases/<case_id>/case.json`이 있으면 끝난 케이스로 보고 건너뛴다. SynthStrip 결과가 남아 있으면 Docker를 다시 돌리지 않는다.
+- `cases/<case_id>/case.json`이 있으면 끝난 케이스로 보고 건너뛴다. SynthStrip 결과가 남아 있으면 SynthStrip을 다시 돌리지 않는다. 단, 백엔드나 이미지가 바뀌면 다시 돌린다.
 - manifest에는 끝난 케이스만 들어간다. 실패한 케이스가 남긴 PNG가 `images/`에 있을 수 있으므로 학습 목록은 manifest를 기준으로 쓴다.
 - 다른 도구가 만든 폴더나 다른 설정으로 만든 폴더에는 쓰지 않는다. 덮어쓰려면 `--overwrite`를 쓴다.
 

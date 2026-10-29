@@ -117,7 +117,7 @@ def needs_skullstrip(case_dir: Path, case_id: str, settings: dict) -> bool:
     marker = case_dir / "case.json"
     if marker.exists():
         previous = json.loads(marker.read_text())["settings"]
-        return previous["synthstrip_image"] != settings["synthstrip_image"]
+        return any(previous[k] != settings[k] for k in ("skullstrip_backend", "synthstrip_image"))
     return False
 
 
@@ -137,9 +137,7 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
     brain_path, mask_path = skullstrip_paths(case_dir, case_id)
     if needs_skullstrip(case_dir, case_id, settings):
         with _SKULLSTRIP_SLOTS or nullcontext():
-            pp.SKULLSTRIP_BACKENDS[settings["skullstrip_backend"]](
-                input_path, brain_path, mask_path, settings["synthstrip_image"], settings["docker_platform"]
-            )
+            pp.SKULLSTRIP_BACKENDS[settings["skullstrip_backend"]](input_path, brain_path, mask_path, settings)
 
     corrected, mask = pp.n4_bias_correct(brain_path, mask_path)
     corrected *= mask
@@ -264,6 +262,7 @@ def run(args: argparse.Namespace) -> int:
         "skullstrip_backend": args.skullstrip_backend,
         "synthstrip_image": args.synthstrip_image,
         "docker_platform": args.platform,
+        "synthstrip_python": args.synthstrip_python,
         "orientation": args.orientation,
         "normalization": args.normalization,
         "size_policy": args.size_policy,
@@ -288,12 +287,17 @@ def run(args: argparse.Namespace) -> int:
         (out_dir / class_dir / "images").mkdir(parents=True, exist_ok=True)
     (out_dir / "logs").mkdir(parents=True, exist_ok=True)
     skullstrip_slots = args.workers
-    if args.skullstrip_backend == "docker" and any(
-        needs_skullstrip(out_dir / "cases" / c, c, settings) for c in case_ids
-    ):
-        pp.check_docker_available()
-        skullstrip_slots = min(args.workers, pp.docker_parallel_slots())
-        print(f"[INFO] concurrent SynthStrip containers: {skullstrip_slots} (Docker memory limit)")
+    if any(needs_skullstrip(out_dir / "cases" / c, c, settings) for c in case_ids):
+        if args.skullstrip_backend == "docker":
+            pp.check_docker_available()
+            skullstrip_slots = min(args.workers, pp.docker_parallel_slots())
+        else:
+            if not settings["synthstrip_python"]:
+                raise ValueError("native backend needs the fhv_synthstrip conda env (requirements-synthstrip.txt), "
+                                 "--synthstrip-python or FHV_SYNTHSTRIP_PYTHON; or use --skullstrip-backend docker")
+            pp.native_synthstrip_home(args.synthstrip_image, args.platform)  # extract once, before workers start
+            skullstrip_slots = min(args.workers, pp.SYNTHSTRIP_NATIVE_SLOTS)
+        print(f"[INFO] concurrent SynthStrip runs: {skullstrip_slots}")
 
     metadata = {
         "pipeline": PIPELINE_NAME,
@@ -361,6 +365,14 @@ def run(args: argparse.Namespace) -> int:
     return 1 if metadata["counts"]["failed"] else 0
 
 
+def default_synthstrip_python() -> str | None:
+    """$FHV_SYNTHSTRIP_PYTHON, else <conda>/envs/fhv_synthstrip/bin/python next to the running env."""
+    if os.environ.get("FHV_SYNTHSTRIP_PYTHON"):
+        return os.environ["FHV_SYNTHSTRIP_PYTHON"]
+    candidate = Path(sys.prefix).parent / "fhv_synthstrip" / "bin" / "python"
+    return str(candidate) if candidate.exists() else None
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--src-dir", required=True, help="Folder searched recursively for input FLAIR NIfTI files.")
@@ -373,8 +385,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=4, help="Cases processed in parallel.")
     parser.add_argument("--overwrite", action="store_true", help="Re-run finished cases and allow changed settings.")
     parser.add_argument("--no-qc", action="store_true", help="Skip the per-case QC PNG.")
-    parser.add_argument("--skullstrip-backend", choices=sorted(pp.SKULLSTRIP_BACKENDS), default="docker")
-    parser.add_argument("--synthstrip-image", default=pp.DEFAULT_SYNTHSTRIP_IMAGE)
+    parser.add_argument("--skullstrip-backend", choices=sorted(pp.SKULLSTRIP_BACKENDS), default="native",
+                        help="native: SynthStrip on the Apple GPU (MPS); docker: the amd64 image under emulation.")
+    parser.add_argument("--synthstrip-image", default=pp.DEFAULT_SYNTHSTRIP_IMAGE,
+                        help="Docker image to run, or to copy mri_synthstrip and weights from (native).")
+    parser.add_argument("--synthstrip-python", default=default_synthstrip_python(),
+                        help="native backend: python with PyTorch (MPS Conv3d) and surfa. "
+                             "Default: $FHV_SYNTHSTRIP_PYTHON, else the sibling conda env 'fhv_synthstrip'.")
     parser.add_argument("--platform", default="linux/amd64", help="Docker --platform; the SynthStrip image is amd64-only.")
     parser.add_argument("--orientation", choices=pp.ORIENTATIONS, default="LAS")
     parser.add_argument("--normalization", choices=sorted(pp.NORMALIZATION_POLICIES), default="slice_p1_p99")

@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 실행
 
-- 환경: conda `flair_preproc`(Python 3.10, nibabel, SimpleITK, opencv, pandas, openpyxl, matplotlib). Skull stripping에 Docker Desktop과 `freesurfer/synthstrip` 이미지가 필요하다. 이 이미지는 amd64 전용이라 Apple Silicon에서는 에뮬레이션으로 돈다.
+- 환경: conda `flair_preproc`(Python 3.10, nibabel, SimpleITK, opencv, pandas, openpyxl, matplotlib). Skull stripping의 기본 백엔드인 `native`는 같은 conda 아래의 `fhv_synthstrip` 환경(`requirements-synthstrip.txt`)이 필요하다. 처음 한 번은 Docker Desktop이 켜져 있어야 `freesurfer/synthstrip` 이미지에서 스크립트와 가중치를 복사할 수 있다. `--skullstrip-backend docker`는 amd64 이미지를 에뮬레이션으로 돌리며 약 4배 느리다.
 - 빌드 설정, 테스트, 린터는 없다.
 
 ```bash
@@ -26,7 +26,7 @@ python -m modules.pipeline ... --pid BP00013_P17914 --workers 1   # 한 케이�
 ## 아키텍처
 
 - `modules/pipeline.py`: CLI, 케이스 탐색, 라벨 매칭, 케이스 단위 병렬 처리(`ProcessPoolExecutor`), PNG/manifest/QC/메타데이터 쓰기.
-- `modules/preprocess.py`: 단계별 연산. SynthStrip(Docker) → N4 → mask → 방향 정렬 → 슬라이스 정규화 → 크기 맞춤 → PNG 픽셀.
+- `modules/preprocess.py`: 단계별 연산. SynthStrip(native MPS 또는 Docker) → N4 → mask → 방향 정렬 → 슬라이스 정규화 → 크기 맞춤 → PNG 픽셀.
 - `modules/labels.py`: 라벨 표를 `{case_id: CaseLabel}`로 읽는다. 표에 scan 열이 있으면 `case_id`는 `id_subject_id_scan`(또는 `id_session`)이고, 없으면 `id_subject`다.
 
 핵심 설계:
@@ -43,7 +43,8 @@ python -m modules.pipeline ... --pid BP00013_P17914 --workers 1   # 한 케이�
 - 기본값은 LAS, 슬라이스별 전체 화소 1–99 백분위수 정규화, 512 resize, 8-bit PNG다.
 - 새 코드로 Docker SynthStrip을 돌린 마스크는 기존 마스크와 voxel 단위로 같다.
 - N4 `N4_SHRINK_XYZ=(1,1,1)`로 돌리면 기존 PNG와 픽셀이 완전히 같다(PAIK 6 case 실측). 기본값 `(4,4,1)`은 약 10배 빠르고 평균 0.05–0.09 계조 차이가 난다.
-- SynthStrip 동시 실행 수는 Docker 메모리 / 6 GiB로 제한된다(`docker_parallel_slots`, 프로세스 간 semaphore).
+- SynthStrip 동시 실행 수는 프로세스 간 semaphore로 제한한다. Docker는 메모리 / 6 GiB(`docker_parallel_slots`), native는 2개다.
+- `native` 백엔드는 Docker 이미지의 `mri_synthstrip`과 가중치를 `~/.cache/fhv_preproc/synthstrip/`에 꺼내고 장치만 MPS로 바꿔 실행한다. 마스크는 Docker와 voxel 1개 이내로 같고 약 4배 빠르다. arm64 CPU PyTorch로 돌리면 Conv3d가 40 GB 이상을 써서 죽는다. FreeSurfer 코드는 저장소에 커밋하지 않는다. PyPI의 surfa 0.6.x는 numpy 2에서 실패하므로 surfa는 master 커밋으로 고정했다.
 - 라벨은 **슬라이스 단위 양성 여부**(1-based `fhv_slice_num`)이며 YOLO bounding box GT와 다르다.
 - 알려진 위험(선행연구 검토, 미적용):
   - 정규화에 마스크 밖의 0이 섞이고, 슬라이스 단위라 밝은 FHV가 99%에서 포화될 수 있다.
@@ -67,4 +68,4 @@ python -m modules.pipeline ... --pid BP00013_P17914 --workers 1   # 한 케이�
 
 - 코호트별 스캐너 제조사, 자장 세기, 슬라이스 두께, in-plane 해상도
 - DICOM → NIfTI 변환 도구와 옵션(예: dcm2niix)
-- 네이티브(Docker 없는) SynthStrip이 Docker 결과와 같은 마스크를 내는지 검증 → 같으면 `SKULLSTRIP_BACKENDS`에 추가. 현재 병목이다(에뮬레이션, 컨테이너당 최대 약 5.6 GiB라 동시에 2개까지만 실행).
+- 전체 코호트에서 `native`와 `docker` 마스크를 표본 비교(현재는 PAIK 6 case만 검증).

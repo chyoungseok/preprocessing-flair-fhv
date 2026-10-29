@@ -8,6 +8,9 @@ dict and exposing the new key as a CLI choice in ``modules.pipeline``.
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import subprocess as sp
 from pathlib import Path
 
@@ -40,22 +43,8 @@ def docker_parallel_slots() -> int:
     return max(1, int(out.strip()) // SYNTHSTRIP_PEAK_BYTES)
 
 
-def synthstrip_docker(input_path: Path, brain_path: Path, mask_path: Path, image: str, platform: str | None) -> None:
-    """Run SynthStrip in a throwaway Docker container (default mask, CSF included)."""
-    input_path = input_path.resolve()
-    out_dir = brain_path.parent.resolve()
-    cmd = ["docker", "run", "--rm"]
-    if platform:
-        cmd += ["--platform", platform]
-    cmd += [
-        "-v", f"{input_path.parent}:/data:ro",
-        "-v", f"{out_dir}:/out",
-        image,
-        "-i", f"/data/{input_path.name}",
-        "-o", f"/out/{brain_path.name}",
-        "-m", f"/out/{mask_path.name}",
-    ]
-    result = sp.run(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+def _run_synthstrip(cmd: list[str], brain_path: Path, mask_path: Path, env: dict | None = None) -> None:
+    result = sp.run(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"SynthStrip failed ({result.returncode}):\n{result.stdout[-2000:]}")
     missing = [str(p) for p in (brain_path, mask_path) if not p.exists()]
@@ -63,7 +52,68 @@ def synthstrip_docker(input_path: Path, brain_path: Path, mask_path: Path, image
         raise FileNotFoundError(f"SynthStrip finished but outputs are missing: {missing}")
 
 
-SKULLSTRIP_BACKENDS = {"docker": synthstrip_docker}
+def synthstrip_docker(input_path: Path, brain_path: Path, mask_path: Path, settings: dict) -> None:
+    """Run SynthStrip in a throwaway Docker container (default mask, CSF included)."""
+    input_path = input_path.resolve()
+    cmd = ["docker", "run", "--rm"]
+    if settings["docker_platform"]:
+        cmd += ["--platform", settings["docker_platform"]]
+    cmd += [
+        "-v", f"{input_path.parent}:/data:ro",
+        "-v", f"{brain_path.parent.resolve()}:/out",
+        settings["synthstrip_image"],
+        "-i", f"/data/{input_path.name}",
+        "-o", f"/out/{brain_path.name}",
+        "-m", f"/out/{mask_path.name}",
+    ]
+    _run_synthstrip(cmd, brain_path, mask_path)
+
+
+# The native backend runs the same mri_synthstrip script and weights as the Docker
+# image, copied out of it once and switched from CPU to the Apple GPU (MPS):
+# arm64 CPU PyTorch needs >40 GB for SynthStrip's Conv3d, MPS ~1 GB.
+# On 6 PAIK cases the MPS masks matched Docker in all but 1 voxel.
+SYNTHSTRIP_CACHE = Path.home() / ".cache" / "fhv_preproc" / "synthstrip"
+SYNTHSTRIP_CPU_LINE = "device = torch.device('cpu')"
+SYNTHSTRIP_NATIVE_SLOTS = 2  # concurrent MPS runs
+
+
+def native_synthstrip_home(image: str, platform: str | None) -> Path:
+    """Return a FREESURFER_HOME holding the image's mri_synthstrip (MPS) and models; extract once."""
+    home = SYNTHSTRIP_CACHE / re.sub(r"[^A-Za-z0-9._-]", "_", image)
+    if (home / "mri_synthstrip").exists():
+        return home
+    check_docker_available()
+    staging = home.with_name(home.name + ".staging")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    create = ["docker", "create"] + (["--platform", platform] if platform else []) + [image]
+    container = sp.run(create, check=True, stdout=sp.PIPE, text=True).stdout.strip()
+    try:
+        for path in ("/freesurfer/mri_synthstrip", "/freesurfer/models"):
+            sp.run(["docker", "cp", f"{container}:{path}", str(staging)], check=True, stdout=sp.DEVNULL)
+    finally:
+        sp.run(["docker", "rm", container], check=True, stdout=sp.DEVNULL)
+    script = staging / "mri_synthstrip"
+    source = script.read_text()
+    if source.count(SYNTHSTRIP_CPU_LINE) != 1:
+        raise RuntimeError(f"unexpected mri_synthstrip in {image}; cannot switch it to MPS")
+    script.write_text(source.replace(SYNTHSTRIP_CPU_LINE, "device = torch.device('mps')"))
+    digest = sp.run(["docker", "image", "inspect", "--format", "{{.Id}}", image], check=True, stdout=sp.PIPE, text=True)
+    (staging / "image_id.txt").write_text(digest.stdout)
+    staging.rename(home)
+    return home
+
+
+def synthstrip_native(input_path: Path, brain_path: Path, mask_path: Path, settings: dict) -> None:
+    """Run the cached mri_synthstrip on MPS with ``settings['synthstrip_python']`` (torch + surfa)."""
+    home = native_synthstrip_home(settings["synthstrip_image"], settings["docker_platform"])
+    cmd = [settings["synthstrip_python"], "-I", str(home / "mri_synthstrip"),
+           "-i", str(input_path), "-o", str(brain_path), "-m", str(mask_path)]
+    _run_synthstrip(cmd, brain_path, mask_path, env={**os.environ, "FREESURFER_HOME": str(home)})
+
+
+SKULLSTRIP_BACKENDS = {"docker": synthstrip_docker, "native": synthstrip_native}
 
 
 # ---------------------------------------------------------------------------

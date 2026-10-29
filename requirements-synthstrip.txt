@@ -1,0 +1,10 @@
+# Python for the native SynthStrip backend (Apple GPU / MPS). Verified on Apple M4 Pro:
+#   conda create -n fhv_synthstrip python=3.12
+#   /opt/anaconda3/envs/fhv_synthstrip/bin/pip install -r requirements-synthstrip.txt
+# torch 2.1.2 (the Docker image's version) has no Conv3d on MPS.
+# surfa 0.6.x from PyPI fails with numpy 2 (ValueError in reorient), so surfa is pinned to a master commit.
+torch==2.15.0
+numpy==2.3.5
+scipy==1.18.1
+nibabel==5.4.2
+surfa @ git+https://github.com/freesurfer/surfa@3d282add0a4365c5b0669bc03f00481ee1983ef0
