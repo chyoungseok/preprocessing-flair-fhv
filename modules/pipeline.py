@@ -1,17 +1,18 @@
-"""FLAIR NIfTI -> YOLO PNG preprocessing pipeline.
+"""FLAIR NIfTI -> axial slice PNG preprocessing pipeline.
 
 Per case: SynthStrip -> N4 (in brain mask) -> mask -> reorient (LAS) ->
 brain-mask volume 0.5-99.5 percentile normalization -> in-plane resample to
-0.41 mm and pad/crop to 512x512 -> 8-bit PNG. ``cases/<id>/case.json`` keeps the
-canvas geometry (how voxels map onto the PNG).
+0.41 mm and pad/crop to 512x512 -> 8-bit PNG. Every step's volume is saved as NIfTI.
 
 Output layout (``--out-dir``)::
 
-    positive_slices_all/images/<case_id>__slice_0013.png, manifest.csv
-    negative_slices_all/images/<case_id>__slice_0001.png, manifest.csv
-    cases/<case_id>/   SynthStrip brain/mask NIfTI, QC PNG, case.json (done marker)
-    cases.csv          per-case status (done / failed / unlabeled / missing_input)
-    run_metadata.json  settings and package versions
+    png/positive_slices/<case_id>/<case_id>__slice_0013.png
+    png/negative_slices/<case_id>/<case_id>__slice_0001.png
+    png/manifest.csv       one row per PNG, label 0/1
+    FLAIR_nii_p/<case_id>/ per-step NIfTI (see STAGE_SUFFIXES), QC PNG,
+                           case.json (done marker, canvas geometry)
+    cases.csv              per-case status (done / failed / unlabeled / missing_input)
+    run_metadata.json      settings and package versions
     logs/errors.txt
 
 Only cases present in the label table are exported. A slice listed in
@@ -20,9 +21,9 @@ Only cases present in the label table are exported. A slice listed in
 Example
 -------
 python -m modules.pipeline \
-    --src-dir /Volumes/GURI_1/FLAIR_PAIK_nii \
-    --out-dir /Volumes/GURI_1/20261029_FLAIR_PAIK_yolo_png \
-    --label-xlsx /Users/yschoi/code/09_FHV/csv_files/df_flair_label_UHKinspection.xlsx
+    --src-dir "/Volumes/One Touch/01_raw_data/01_stroke/PAIK_hospital/FLAIR_nii" \
+    --out-dir "/Volumes/One Touch/02_processed_data/1_stroke/PAIK_hospital/YYYYMMDD_FLAIR_preproc" \
+    --label-xlsx data/labels/df_flair_label_UHKinspection.xlsx
 """
 
 from __future__ import annotations
@@ -48,7 +49,21 @@ from modules.labels import DEFAULT_LABEL_COLUMN, CaseLabel, load_label_table, ma
 
 
 PIPELINE_NAME = "modules.pipeline"
-CLASS_DIRS = {1: "positive_slices_all", 0: "negative_slices_all"}
+# Bump when the output folder layout changes; resuming into another layout is refused.
+OUTPUT_LAYOUT = "png+FLAIR_nii_p/v1"
+PNG_DIR = "png"
+NIFTI_DIR = "FLAIR_nii_p"
+CLASS_DIRS = {1: f"{PNG_DIR}/positive_slices", 0: f"{PNG_DIR}/negative_slices"}
+# Per-step NIfTI written to FLAIR_nii_p/<case_id>/<case_id><suffix>.nii.gz
+STAGE_SUFFIXES = {
+    "brain": "_FLAIR_brain",                                            # 1 SynthStrip
+    "mask": "_FLAIR_brainMask",                                         # 1 SynthStrip mask
+    "n4": "_FLAIR_brain_bfCorrected",                                   # 2 N4
+    "masked": "_FLAIR_brain_bfCorrected_masked",                        # 3 mask re-applied
+    "reorient": "_FLAIR_brain_bfCorrected_masked_reorient",             # 4 LAS
+    "norm": "_FLAIR_brain_bfCorrected_masked_reorient_norm",            # 5 [0, 1]
+    "resampled": "_FLAIR_brain_bfCorrected_masked_reorient_norm_resampled",  # 6 PNG grid
+}
 MANIFEST_COLUMNS = (
     "case_id", "label", "slice_index_1based", "png_relative_path", "label_table_row",
     "fhv_slice_num_source", "source_nifti", "shape_xyz", "zooms_xyz",
@@ -108,13 +123,27 @@ def save_qc(path: Path, raw_xyz: np.ndarray, mask_xyz: np.ndarray, corrected_xyz
     plt.close(fig)
 
 
-def skullstrip_paths(case_dir: Path, case_id: str) -> tuple[Path, Path]:
-    return case_dir / f"{case_id}_brain.nii.gz", case_dir / f"{case_id}_brainMask.nii.gz"
+def nifti_case_dir(out_dir: Path, case_id: str) -> Path:
+    return out_dir / NIFTI_DIR / case_id
+
+
+def stage_path(case_dir: Path, case_id: str, stage: str) -> Path:
+    return case_dir / f"{case_id}{STAGE_SUFFIXES[stage]}.nii.gz"
+
+
+def save_nifti(path: Path, data: np.ndarray, affine: np.ndarray, dtype=np.float32) -> None:
+    import nibabel as nib
+
+    img = nib.Nifti1Image(np.asarray(data, dtype=dtype), affine)
+    img.set_qform(affine, code=1)
+    img.set_sform(affine, code=1)
+    img.header.set_xyzt_units("mm", "sec")
+    nib.save(img, str(path))
 
 
 def needs_skullstrip(case_dir: Path, case_id: str, settings: dict) -> bool:
     """SynthStrip outputs are reused, even with --overwrite, unless missing or made by another image."""
-    if not all(p.exists() for p in skullstrip_paths(case_dir, case_id)):
+    if not all(stage_path(case_dir, case_id, s).exists() for s in ("brain", "mask")):
         return True
     marker = case_dir / "case.json"
     if marker.exists():
@@ -130,23 +159,28 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
     from nibabel.orientations import aff2axcodes
 
     case_id = label.case_id
-    case_dir = out_dir / "cases" / case_id
+    case_dir = nifti_case_dir(out_dir, case_id)
     done_marker = case_dir / "case.json"
     if done_marker.exists() and not overwrite:
         return json.loads(done_marker.read_text())
     case_dir.mkdir(parents=True, exist_ok=True)
 
-    brain_path, mask_path = skullstrip_paths(case_dir, case_id)
+    def path(stage: str) -> Path:
+        return stage_path(case_dir, case_id, stage)
+
     if needs_skullstrip(case_dir, case_id, settings):
         with _SKULLSTRIP_SLOTS or nullcontext():
-            pp.SKULLSTRIP_BACKENDS[settings["skullstrip_backend"]](input_path, brain_path, mask_path, settings)
+            pp.SKULLSTRIP_BACKENDS[settings["skullstrip_backend"]](input_path, path("brain"), path("mask"), settings)
 
-    corrected, mask = pp.n4_bias_correct(brain_path, mask_path)
-    corrected *= mask
     source = nib.load(str(input_path))
     affine = source.affine
+    corrected, mask = pp.n4_bias_correct(path("brain"), path("mask"))
+    save_nifti(path("n4"), corrected, affine)
+    corrected *= mask
+    save_nifti(path("masked"), corrected, affine)
     volume, oriented_affine = pp.reorient(corrected, affine, settings["orientation"])
     mask_oriented, _ = pp.reorient(mask, affine, settings["orientation"])
+    save_nifti(path("reorient"), volume, oriented_affine)
     zooms_xy = np.sqrt((oriented_affine[:3, :2] ** 2).sum(axis=0))
     n_slices = volume.shape[2]
     positives = set(label.positive_slices_1based)
@@ -155,7 +189,9 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
         raise ValueError(f"label slices {out_of_range} exceed slice count {n_slices}")
 
     normalized = pp.NORMALIZATION_POLICIES[settings["normalization"]](volume, mask_oriented)
+    save_nifti(path("norm"), normalized, oriented_affine)
     canvas, geometry = pp.SIZE_POLICIES[settings["size_policy"]](normalized, mask_oriented, zooms_xy, settings["target_size"])
+    save_nifti(path("resampled"), canvas, pp.canvas_affine(oriented_affine, geometry))
     rows = []
     pixels_by_z = {}
     for z in range(n_slices):
@@ -163,9 +199,10 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
         cls = int(slice_1based in positives)
         pixels = pp.to_png_pixels(canvas[:, :, z])
         filename = f"{case_id}__slice_{slice_1based:04d}.png"
-        relative = Path(CLASS_DIRS[cls]) / "images" / filename
+        relative = Path(CLASS_DIRS[cls]) / case_id / filename
         # A label edit between runs can move a slice to the other class folder.
-        (out_dir / CLASS_DIRS[1 - cls] / "images" / filename).unlink(missing_ok=True)
+        (out_dir / CLASS_DIRS[1 - cls] / case_id / filename).unlink(missing_ok=True)
+        (out_dir / relative).parent.mkdir(parents=True, exist_ok=True)
         if not cv2.imwrite(str(out_dir / relative), pixels, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
             raise OSError(f"failed to write {relative}")
         pixels_by_z[z] = pixels
@@ -248,12 +285,14 @@ def _package_versions() -> dict:
 def check_output_dir(out_dir: Path, settings: dict, overwrite: bool) -> None:
     """Refuse to mix outputs from a different tool or different pixel settings."""
     metadata_path = out_dir / "run_metadata.json"
-    existing = [out_dir / d for d in CLASS_DIRS.values() if (out_dir / d).exists()]
+    existing = [out_dir / d for d in (PNG_DIR, NIFTI_DIR) if (out_dir / d).exists()]
     if not metadata_path.exists():
         if existing:
-            raise FileExistsError(f"{out_dir} already has class folders not made by {PIPELINE_NAME}; use a new --out-dir")
+            raise FileExistsError(f"{out_dir} already has {PNG_DIR}/ or {NIFTI_DIR}/ not made by {PIPELINE_NAME}; use a new --out-dir")
         return
     previous = json.loads(metadata_path.read_text())
+    if previous.get("layout") != OUTPUT_LAYOUT:
+        raise FileExistsError(f"{out_dir} uses output layout {previous.get('layout')!r}, not {OUTPUT_LAYOUT!r}; use a new --out-dir")
     changed = {k: (previous.get("settings", {}).get(k), settings[k]) for k in SETTING_KEYS
                if previous.get("settings", {}).get(k) != settings[k]}
     if changed and not overwrite:
@@ -291,10 +330,11 @@ def run(args: argparse.Namespace) -> int:
     print(f"[INFO] inputs={len(found)} matched={len(inputs)} labelled={len(labels)} to_process={len(case_ids)} workers={args.workers}")
 
     for class_dir in CLASS_DIRS.values():
-        (out_dir / class_dir / "images").mkdir(parents=True, exist_ok=True)
+        (out_dir / class_dir).mkdir(parents=True, exist_ok=True)
+    (out_dir / NIFTI_DIR).mkdir(parents=True, exist_ok=True)
     (out_dir / "logs").mkdir(parents=True, exist_ok=True)
     skullstrip_slots = args.workers
-    if any(needs_skullstrip(out_dir / "cases" / c, c, settings) for c in case_ids):
+    if any(needs_skullstrip(nifti_case_dir(out_dir, c), c, settings) for c in case_ids):
         if args.skullstrip_backend == "docker":
             pp.check_docker_available()
             skullstrip_slots = min(args.workers, pp.docker_parallel_slots())
@@ -308,6 +348,7 @@ def run(args: argparse.Namespace) -> int:
 
     metadata = {
         "pipeline": PIPELINE_NAME,
+        "layout": OUTPUT_LAYOUT,
         "started": datetime.now().isoformat(timespec="seconds"),
         "command": " ".join(sys.argv),
         "src_dir": str(src_dir),
@@ -354,14 +395,13 @@ def run(args: argparse.Namespace) -> int:
 
     # Manifests cover every completed case in this output, including earlier runs.
     reported = {row["case_id"] for row in status_rows}
-    for marker in sorted((out_dir / "cases").glob("*/case.json")):
+    for marker in sorted((out_dir / NIFTI_DIR).glob("*/case.json")):
         case_id = marker.parent.name
         record = records.setdefault(case_id, json.loads(marker.read_text()))
         if case_id not in reported:
             status_rows.append({"case_id": case_id, "status": "done", "detail": f"slices={record['n_slices']} positive={record['n_positive']}"})
-    for cls, class_dir in CLASS_DIRS.items():
-        rows = [row for c in sorted(records) for row in records[c]["rows"] if row["label"] == cls]
-        _write_csv(out_dir / class_dir / "manifest.csv", MANIFEST_COLUMNS, rows)
+    rows = [row for c in sorted(records) for row in records[c]["rows"]]
+    _write_csv(out_dir / PNG_DIR / "manifest.csv", MANIFEST_COLUMNS, rows)
     _write_csv(out_dir / "cases.csv", ("case_id", "status", "detail"), sorted(status_rows, key=lambda r: r["case_id"]))
 
     metadata["finished"] = datetime.now().isoformat(timespec="seconds")
@@ -401,10 +441,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "Default: $FHV_SYNTHSTRIP_PYTHON, else the sibling conda env 'fhv_synthstrip'.")
     parser.add_argument("--platform", default="linux/amd64", help="Docker --platform; the SynthStrip image is amd64-only.")
     parser.add_argument("--orientation", choices=pp.ORIENTATIONS, default="LAS")
-    parser.add_argument("--normalization", choices=sorted(pp.NORMALIZATION_POLICIES), default="volume_brain_p05_p995",
-                        help="legacy_slice_p1_p99 reproduces the 2026-08-13 PAIK YOLO data.")
+    parser.add_argument("--normalization", choices=sorted(pp.NORMALIZATION_POLICIES), default="volume_brain_p05_p995")
     parser.add_argument("--size-policy", choices=sorted(pp.SIZE_POLICIES), default="fixed_spacing_pad",
-                        help=f"fixed_spacing_pad: {pp.TARGET_SPACING_MM} mm/px, then pad/crop; legacy_resize: stretch to size.")
+                        help=f"fixed_spacing_pad: {pp.TARGET_SPACING_MM} mm/px, then pad/crop to --target-size.")
     parser.add_argument("--target-size", type=int, default=512)
     return parser
 

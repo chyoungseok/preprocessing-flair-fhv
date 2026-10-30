@@ -173,9 +173,9 @@ ORIENTATIONS = ("LAS",)
 def normalize_volume_brain_p05_p995(volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Min-max between the 0.5/99.5 percentiles of brain-mask voxels of the whole volume; outside mask = 0.
 
-    One range per scan keeps contrast consistent across slices, and the 99.5 cap leaves
-    the brightest structures (FHV) mostly unsaturated (example scan: 0.03% vs 0.81% of
-    FHV-box pixels at 255 with the legacy per-slice 1-99 policy).
+    One range per scan keeps contrast consistent across slices; computing it on brain
+    voxels only keeps background zeros out of the statistics, and the 99.5 cap leaves
+    the brightest structures (FHV) mostly unsaturated.
     """
     brain = volume[mask]
     if brain.size == 0:
@@ -186,21 +186,7 @@ def normalize_volume_brain_p05_p995(volume: np.ndarray, mask: np.ndarray) -> np.
     return (np.clip((volume - vmin) / (vmax - vmin), 0, 1) * mask).astype(np.float32)
 
 
-def normalize_legacy_slice_p1_p99(volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Legacy (2026-08-13 PAIK YOLO data): per slice, 1/99 percentiles of all pixels incl. background."""
-    out = np.zeros(volume.shape, dtype=np.float32)
-    for z in range(volume.shape[2]):
-        sl = volume[:, :, z].astype(np.float32, copy=False)
-        vmin, vmax = np.percentile(sl, (1, 99))
-        if vmax > vmin:
-            out[:, :, z] = np.clip((sl - vmin) / (vmax - vmin), 0, 1)
-    return out
-
-
-NORMALIZATION_POLICIES = {
-    "volume_brain_p05_p995": normalize_volume_brain_p05_p995,
-    "legacy_slice_p1_p99": normalize_legacy_slice_p1_p99,
-}
+NORMALIZATION_POLICIES = {"volume_brain_p05_p995": normalize_volume_brain_p05_p995}
 
 
 # PAIK median FOV 210 mm / 512 px. 512 px then covers 210 mm, larger than an adult brain.
@@ -268,24 +254,20 @@ def size_fixed_spacing_pad(volume: np.ndarray, mask: np.ndarray, zooms_xy, size:
     return _place_on_canvas(resampled, tuple(offset), size), geometry
 
 
-def size_legacy_resize(volume: np.ndarray, mask: np.ndarray, zooms_xy, size: int):
-    """Legacy (2026-08-13 PAIK YOLO data): stretch every slice to ``size x size`` (pixel = FOV / size)."""
-    nx, ny = volume.shape[:2]
-    geometry = {
-        "shape_xy": [nx, ny],
-        "zooms_xy": [float(zooms_xy[0]), float(zooms_xy[1])],
-        "resampled_xy": [size, size],
-        "offset_xy": [0, 0],
-        "canvas": size,
-        "brain_cropped": False,
-    }
-    return _resample_slices(volume, (size, size)), geometry
+SIZE_POLICIES = {"fixed_spacing_pad": size_fixed_spacing_pad}
 
 
-SIZE_POLICIES = {
-    "fixed_spacing_pad": size_fixed_spacing_pad,
-    "legacy_resize": size_legacy_resize,
-}
+def canvas_affine(affine: np.ndarray, geometry: dict) -> np.ndarray:
+    """Voxel-to-world affine of the canvas volume, given the affine of the volume it was made from.
+
+    cv2 resizing aligns pixel centres: old index = (new index - offset + 0.5) * n / w - 0.5.
+    """
+    index_map = np.eye(4)
+    for axis in range(2):
+        scale = geometry["shape_xy"][axis] / geometry["resampled_xy"][axis]
+        index_map[axis, axis] = scale
+        index_map[axis, 3] = (0.5 - geometry["offset_xy"][axis]) * scale - 0.5
+    return affine @ index_map
 
 
 def to_png_pixels(slice_xy: np.ndarray) -> np.ndarray:
