@@ -29,7 +29,7 @@ python -m modules.pipeline \
 
 ### 2026-10-29 기본값 변경 (정규화·크기)
 
-기존 YOLO 학습 데이터(2026-08-13 PAIK 실행)와 **PNG가 다르다.** 그래서 YOLO를 다시 학습해야 하고, 기존 GT 박스도 좌표를 변환해야 한다(아래 "GT 박스 변환").
+기존 YOLO 학습 데이터(2026-08-13 PAIK 실행)와 **PNG가 다르다.** 이 파이프라인은 PNG 저장까지만 한다. 박스 GT는 다루지 않는다.
 
 - **정규화:** 예전 방식은 슬라이스마다 배경 0까지 섞어 백분위수를 계산했다. 그래서 뇌가 작은 슬라이스는 대비가 과하게 커지고, 밝은 FHV가 포화됐다.
   - 예시 scan의 FHV 박스 안 255 화소 비율: 예전 0.81%(최대 4.5%), 새 방식 0.03%(최대 0.25%).
@@ -41,25 +41,13 @@ python -m modules.pipeline \
   - FOV 210 mm인 scan(PAIK의 대부분)은 geometry가 예전과 같다.
 - **예전 데이터 재현:** `--normalization legacy_slice_p1_p99 --size-policy legacy_resize`. 이렇게 돌리면 예전 기본값 결과와 PNG가 완전히 같다(6 case, 144장 확인). SynthStrip 마스크는 예전 마스크와 voxel 단위로 같고, 예전 PNG와의 차이는 N4 `(4,4,1)` 축소에서 오는 평균 0.05–0.09 계조뿐이다.
 
-## GT 박스 변환
+### PNG geometry
 
-각 케이스의 `case.json`에 있는 `geometry`가 voxel 좌표와 캔버스 좌표의 관계를 기록한다.
+각 케이스의 `case.json`에 있는 `geometry`가 voxel 좌표와 PNG 캔버스 좌표의 관계를 기록한다.
 
 - `resampled_xy`: 리샘플링한 크기
 - `offset_xy`: 캔버스에 놓은 위치(음수는 crop)
 - `brain_cropped`: crop하다가 뇌가 잘렸는지
-
-예전 PNG(LAS, 512로 늘림)에 그린 YOLO 라벨은 다음 명령으로 새 PNG 좌표로 옮긴다.
-
-```bash
-python -m modules.convert_labels \
-  --labels-dir /Users/yschoi/code/09_FHV/yolo/FHV_bbox_full_v1/labels/train/images \
-  --png-dir <pipeline --out-dir> \
-  --dest <새 빈 폴더>
-```
-
-- 캔버스 밖으로 잘린 박스는 `conversion_report.csv`에 기록된다.
-- 검증 결과: 왕복 변환 오차는 1e-15 수준이다. FOV 240 mm와 372×384 케이스 46개 박스를 겹쳐 그려 보니 같은 FHV 위치에 놓였다.
 
 ## SynthStrip 백엔드
 
@@ -103,7 +91,8 @@ python -m modules.convert_labels \
 ```
 
 - 라벨 표에 없는 입력(`unlabeled`)은 처리하지 않는다. 음성으로 간주하지 않는다.
-- `case_id`는 입력 파일명에서 `_FLAIR` 앞부분이다. 라벨 표에서는 `<id_subject>_<id_scan|id_session>` 또는 `id_subject`로 만든다.
+- 출력 `case_id`는 라벨 표에서 만든 `<id_subject>_<id_scan|id_session>`(또는 `id_subject`)이다.
+- 입력은 파일명의 `_FLAIR` 앞부분으로 찾는다. 이 값이 `case_id`(`BP00001_P14147_FLAIR.nii`)이거나 촬영 ID(`P14147/P14147_FLAIR.nii`, 표에서 `id_scan`이 고유할 때)이면 매칭된다. `--pid`도 둘 다 받는다.
 - `cases/<case_id>/case.json`이 있으면 끝난 케이스로 보고 건너뛴다. SynthStrip 결과가 남아 있으면 SynthStrip을 다시 돌리지 않는다. 단, 백엔드나 이미지가 바뀌면 다시 돌린다.
 - manifest에는 끝난 케이스만 들어간다. 실패한 케이스가 남긴 PNG가 `images/`에 있을 수 있으므로 학습 목록은 manifest를 기준으로 쓴다.
 - 다른 도구가 만든 폴더나 다른 설정으로 만든 폴더에는 쓰지 않는다. 덮어쓰려면 `--overwrite`를 쓴다.

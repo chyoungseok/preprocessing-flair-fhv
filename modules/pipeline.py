@@ -3,7 +3,7 @@
 Per case: SynthStrip -> N4 (in brain mask) -> mask -> reorient (LAS) ->
 brain-mask volume 0.5-99.5 percentile normalization -> in-plane resample to
 0.41 mm and pad/crop to 512x512 -> 8-bit PNG. ``cases/<id>/case.json`` keeps the
-canvas geometry; ``modules.convert_labels`` moves YOLO boxes between geometries.
+canvas geometry (how voxels map onto the PNG).
 
 Output layout (``--out-dir``)::
 
@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 
 from modules import preprocess as pp
-from modules.labels import DEFAULT_LABEL_COLUMN, CaseLabel, load_label_table
+from modules.labels import DEFAULT_LABEL_COLUMN, CaseLabel, load_label_table, match_inputs
 
 
 PIPELINE_NAME = "modules.pipeline"
@@ -277,16 +277,18 @@ def run(args: argparse.Namespace) -> int:
     check_output_dir(out_dir, settings, args.overwrite)
 
     labels = load_label_table(args.label_xlsx, args.label_column)
-    inputs = find_inputs(src_dir, args.pattern)
-    status_rows = [{"case_id": c, "status": "unlabeled", "detail": str(p)} for c, p in inputs.items() if c not in labels]
+    found = find_inputs(src_dir, args.pattern)
+    inputs, unmatched = match_inputs(found, labels)
+    status_rows = [{"case_id": key, "status": "unlabeled", "detail": str(found[key])} for key in unmatched]
     status_rows += [{"case_id": c, "status": "missing_input", "detail": ""} for c in labels if c not in inputs]
 
-    case_ids = sorted(c for c in inputs if c in labels)
+    case_ids = sorted(inputs)
     if args.pid:
-        case_ids = [c for c in case_ids if c in set(args.pid)]
+        pids = set(args.pid)
+        case_ids = [c for c in case_ids if c in pids or labels[c].scan_id in pids]
     if args.limit is not None:
         case_ids = case_ids[: args.limit]
-    print(f"[INFO] inputs={len(inputs)} labelled={len(labels)} to_process={len(case_ids)} workers={args.workers}")
+    print(f"[INFO] inputs={len(found)} matched={len(inputs)} labelled={len(labels)} to_process={len(case_ids)} workers={args.workers}")
 
     for class_dir in CLASS_DIRS.values():
         (out_dir / class_dir / "images").mkdir(parents=True, exist_ok=True)
@@ -385,7 +387,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--label-xlsx", required=True, help="Label table (.xlsx or .csv) with id_subject[, id_scan] and the label column.")
     parser.add_argument("--label-column", default=DEFAULT_LABEL_COLUMN)
     parser.add_argument("--pattern", default="*_FLAIR.nii*", help="Input filename glob; case_id is the part before '_FLAIR'.")
-    parser.add_argument("--pid", action="append", help="Process only this case_id (repeatable).")
+    parser.add_argument("--pid", action="append", help="Process only this case_id or scan ID (repeatable).")
     parser.add_argument("--limit", type=int, default=None, help="Process only the first N labelled cases.")
     parser.add_argument("--workers", type=int, default=4, help="Cases processed in parallel.")
     parser.add_argument("--overwrite", action="store_true", help="Re-run finished cases and allow changed settings.")

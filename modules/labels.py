@@ -29,6 +29,7 @@ class CaseLabel:
     table_row: int
     source_value: str
     positive_slices_1based: tuple[int, ...]
+    scan_id: str | None = None
 
 
 def _clean_id(value: object, column: str, table_row: int) -> str:
@@ -85,8 +86,10 @@ def load_label_table(path: str | Path, label_column: str = DEFAULT_LABEL_COLUMN)
     for index, row in df.iterrows():
         table_row = int(index) + 2  # header is row 1
         case_id = _clean_id(row["id_subject"], "id_subject", table_row)
+        scan_id = None
         if scan_column is not None:
-            case_id = f"{case_id}_{_clean_id(row[scan_column], scan_column, table_row)}"
+            scan_id = _clean_id(row[scan_column], scan_column, table_row)
+            case_id = f"{case_id}_{scan_id}"
         if case_id in labels:
             raise ValueError(f"label row {table_row}: duplicate case {case_id}")
         raw = row[label_column]
@@ -95,5 +98,28 @@ def load_label_table(path: str | Path, label_column: str = DEFAULT_LABEL_COLUMN)
             table_row=table_row,
             source_value="" if pd.isna(raw) else str(raw),
             positive_slices_1based=parse_slice_numbers(raw, table_row),
+            scan_id=scan_id,
         )
     return labels
+
+
+def match_inputs(inputs: dict[str, Path], labels: dict[str, CaseLabel]) -> tuple[dict[str, Path], list[str]]:
+    """Map input keys (filename part before ``_FLAIR``) to label ``case_id``s.
+
+    A key matches either a full ``case_id`` (``BP00001_P14147_FLAIR.nii``) or, when scan IDs
+    are unique in the table, a bare scan ID (``P14147/P14147_FLAIR.nii``). Returns
+    ``({case_id: input path}, [unmatched input keys])``.
+    """
+    scan_ids = [label.scan_id for label in labels.values() if label.scan_id]
+    by_scan = {label.scan_id: label.case_id for label in labels.values()} if len(set(scan_ids)) == len(scan_ids) else {}
+    matched: dict[str, Path] = {}
+    unmatched = []
+    for key, path in inputs.items():
+        case_id = key if key in labels else by_scan.get(key)
+        if case_id is None:
+            unmatched.append(key)
+            continue
+        if case_id in matched:
+            raise ValueError(f"inputs {matched[case_id]} and {path} both match label case {case_id}")
+        matched[case_id] = path
+    return matched, unmatched

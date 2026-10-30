@@ -167,7 +167,7 @@ ORIENTATIONS = ("LAS",)
 # Both policies take the whole reoriented (X, Y, Z) volume. Size policies also
 # return a geometry dict that places the resampled grid on the square canvas:
 # canvas x = voxel x * resampled_xy[0] / shape_xy[0] + offset_xy[0] (same for y).
-# ``convert_box`` uses it to move YOLO boxes between two geometries.
+# PNG column = canvas x, PNG row = canvas - canvas y (see ``to_png_pixels``).
 # ---------------------------------------------------------------------------
 
 def normalize_volume_brain_p05_p995(volume: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -286,29 +286,6 @@ SIZE_POLICIES = {
     "fixed_spacing_pad": size_fixed_spacing_pad,
     "legacy_resize": size_legacy_resize,
 }
-
-
-def convert_box(box_cxcywh, geometry_from: dict, geometry_to: dict):
-    """Move a YOLO box (normalized cx, cy, w, h on the PNG) between two geometries of the same scan.
-
-    PNG column u = canvas x; PNG row v = canvas - canvas y (``flipud`` of the transposed slice).
-    Returns the box clipped to the target canvas, or None when nothing remains inside.
-    """
-    cx, cy, w, h = box_cxcywh
-    c_from, c_to = geometry_from["canvas"], geometry_to["canvas"]
-    corners = []
-    for u, v in ((cx - w / 2, cy - h / 2), (cx + w / 2, cy + h / 2)):
-        xy = (u * c_from, c_from - v * c_from)
-        voxel = [(p - geometry_from["offset_xy"][i]) * geometry_from["shape_xy"][i] / geometry_from["resampled_xy"][i]
-                 for i, p in enumerate(xy)]
-        x_to, y_to = [voxel[i] * geometry_to["resampled_xy"][i] / geometry_to["shape_xy"][i] + geometry_to["offset_xy"][i]
-                      for i in range(2)]
-        corners.append((np.clip(x_to, 0, c_to), np.clip(c_to - y_to, 0, c_to)))
-    (u0, v0), (u1, v1) = corners
-    u0, u1, v0, v1 = min(u0, u1), max(u0, u1), min(v0, v1), max(v0, v1)
-    if u1 - u0 <= 0 or v1 - v0 <= 0:
-        return None
-    return ((u0 + u1) / 2 / c_to, (v0 + v1) / 2 / c_to, (u1 - u0) / c_to, (v1 - v0) / c_to)
 
 
 def to_png_pixels(slice_xy: np.ndarray) -> np.ndarray:

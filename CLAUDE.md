@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - 코호트: 내부 UHK(GT 버전 full-v1, UHK70, UHK100 — 현재 주 연구는 UHK100), 외부 Guri2025, PAIK
 - DICOM → NIfTI 변환은 이 저장소에 없다(도구 미확인).
-- 기존 YOLO 학습 데이터는 `/Users/yschoi/code/09_FHV/yolo/00_preproc_pipeline`(2026-08-13 PAIK 실행)이 만들었다. 2026-10-29부터 정규화와 크기의 기본값이 바뀌어서, 새 PNG는 그 데이터와 다르다(재학습과 GT 박스 변환 필요). `legacy_*` 정책으로 돌리면 그 데이터를 재현할 수 있다.
+- 기존 YOLO 학습 데이터는 `/Users/yschoi/code/09_FHV/yolo/00_preproc_pipeline`(2026-08-13 PAIK 실행)이 만들었다. 2026-10-29부터 정규화와 크기의 기본값이 바뀌어서, 새 PNG는 그 데이터와 다르다. `legacy_*` 정책으로 돌리면 그 데이터를 재현할 수 있다.
 
 ## 슬라이스 라벨의 출처
 
@@ -16,13 +16,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | | 1차 (초기) | 2차 (재검토, 현재 사용) |
 |---|---|---|
-| 파일 | `/Users/yschoi/code/09_FHV/csv_files/FLAIR_slice_qc_20240102.xlsx` (시트 `label_common_V2`) | `/Users/yschoi/code/09_FHV/csv_files/df_flair_label_UHKinspection.xlsx` (`Sheet1`) |
+| 파일 | `data/labels/FLAIR_slice_qc_20240102.xlsx` (시트 `label_common_V2`) | `data/labels/df_flair_label_UHKinspection.xlsx` (`Sheet1`) |
 | 단위 | 환자 1명 = 1행 (1,258행) | 촬영 1회 = 1행 (2,516행) |
 | 환자 ID | `Reg_No` (`BP_00001`, 밑줄 있음) | `id_subject` (`BP00001`) |
 | 촬영 ID | `PKFs` 목록 (예: `['P14147', 'P14163']`), `initial_PK`, `fu_PK` | `id_scan` |
 | init/fu | 열 위치로 구분 | `is_fu` (True/False) |
 | FHV 슬라이스 | `FHV_init_slice`, `FHV_fu_slice` (예: `13-15` 같은 범위 표기) | `fhv_slice_num` (예: `[13, 14, 15]`) |
 
+- `data/labels/`는 원본 `/Users/yschoi/code/09_FHV/csv_files/`의 사본이다(SHA-256 동일). 환자 ID가 들어 있어 `data/`는 git에서 제외되어 있고, 커밋하지 않는다.
 - 슬라이스 번호는 1-based이며 원본 NIfTI의 axial 순서를 따른다.
 - 1차 표의 나머지 열은 거의 쓰지 않는다.
 - **init/fu 대응:** init 촬영은 `initial_PK`, 곧 `PKFs[0]`이다.
@@ -51,14 +52,14 @@ python -m modules.pipeline ... --pid BP00013_P17914 --workers 1   # 한 케이�
 ## 아키텍처
 
 - `modules/pipeline.py`: CLI, 케이스 탐색, 라벨 매칭, 케이스 단위 병렬 처리(`ProcessPoolExecutor`), PNG/manifest/QC/메타데이터 쓰기.
-- `modules/preprocess.py`: 단계별 연산. SynthStrip(native MPS 또는 Docker) → N4 → mask → 방향 정렬 → 볼륨 정규화 → 크기 맞춤(geometry 반환) → PNG 픽셀. `convert_box`는 두 geometry 사이에서 YOLO 박스를 옮긴다.
-- `modules/convert_labels.py`: 예전 PNG(512로 늘림)에 그린 YOLO 라벨을 출력 폴더의 `case.json` geometry로 변환하는 CLI.
+- `modules/preprocess.py`: 단계별 연산. SynthStrip(native MPS 또는 Docker) → N4 → mask → 방향 정렬 → 볼륨 정규화 → 크기 맞춤(geometry 반환) → PNG 픽셀.
+- **범위:** 파이프라인은 PNG 저장까지만 한다. YOLO bounding box GT의 변환이나 생성은 다루지 않는다.
 - `modules/labels.py`: 라벨 표를 `{case_id: CaseLabel}`로 읽는다. 표에 scan 열이 있으면 `case_id`는 `id_subject_id_scan`(또는 `id_session`)이고, 없으면 `id_subject`다.
 
 핵심 설계:
 
 - **정책은 최소한으로 둔다.** 선택지는 `preprocess.py`의 레지스트리(`ORIENTATIONS`, `NORMALIZATION_POLICIES`, `SIZE_POLICIES`, `SKULLSTRIP_BACKENDS`)에 있다. 기본값 외에는 예전 데이터를 재현하는 `legacy_*`와 `docker` 백엔드만 있다. 사용자가 원할 때만 항목을 추가하고, 기본값을 바꾸거나 추가하기 전에 사용자 확인을 받는다.
-- 정규화와 크기 정책은 볼륨 전체를 받는다. 크기 정책은 `geometry`(`shape_xy`, `zooms_xy`, `resampled_xy`, `offset_xy`, `canvas`, `brain_cropped`)를 함께 돌려주고, 이 값은 `case.json`에 기록된다. PNG 좌표를 바꾸는 변경은 반드시 geometry에 반영해야 GT 박스 변환이 맞는다.
+- 정규화와 크기 정책은 볼륨 전체를 받는다. 크기 정책은 `geometry`(`shape_xy`, `zooms_xy`, `resampled_xy`, `offset_xy`, `canvas`, `brain_cropped`)를 함께 돌려주고, 이 값은 `case.json`에 기록된다. PNG 좌표를 바꾸는 변경은 geometry에도 반영한다.
 - **케이스 하나를 메모리에서 끝까지 처리한다.** 디스크에 남는 중간 파일은 SynthStrip의 brain/mask뿐이고, 재실행할 때 이 파일을 재사용한다.
 - `cases/<case_id>/case.json`이 완료 표시다. manifest는 매 실행 끝에 모든 `case.json`에서 다시 만든다.
 - `run_metadata.json`의 `settings`가 출력 폴더의 설정이다. 다른 설정이나 다른 도구가 만든 폴더에는 쓰기를 거부한다(`check_output_dir`).
