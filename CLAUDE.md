@@ -10,6 +10,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - DICOM → NIfTI 변환은 이 저장소에 없다(도구 미확인).
 - 기존 YOLO 학습 데이터는 `/Users/yschoi/code/09_FHV/yolo/00_preproc_pipeline`(2026-08-13 PAIK 실행)이 만들었다. 2026-10-29부터 정규화와 크기의 기본값이 바뀌어서, 새 PNG는 그 데이터와 다르다(재학습과 GT 박스 변환 필요). `legacy_*` 정책으로 돌리면 그 데이터를 재현할 수 있다.
 
+## 슬라이스 라벨의 출처
+
+임상의가 슬라이스마다 FHV가 있는지 보고 기록한 annotation이다. 환자는 보통 MRI를 2회(초기 init, 추적 fu) 촬영했다. 파이프라인은 2차 표만 읽는다(`--label-xlsx`).
+
+| | 1차 (초기) | 2차 (재검토, 현재 사용) |
+|---|---|---|
+| 파일 | `/Users/yschoi/code/09_FHV/csv_files/FLAIR_slice_qc_20240102.xlsx` (시트 `label_common_V2`) | `/Users/yschoi/code/09_FHV/csv_files/df_flair_label_UHKinspection.xlsx` (`Sheet1`) |
+| 단위 | 환자 1명 = 1행 (1,258행) | 촬영 1회 = 1행 (2,516행) |
+| 환자 ID | `Reg_No` (`BP_00001`, 밑줄 있음) | `id_subject` (`BP00001`) |
+| 촬영 ID | `PKFs` 목록 (예: `['P14147', 'P14163']`), `initial_PK`, `fu_PK` | `id_scan` |
+| init/fu | 열 위치로 구분 | `is_fu` (True/False) |
+| FHV 슬라이스 | `FHV_init_slice`, `FHV_fu_slice` (예: `13-15` 같은 범위 표기) | `fhv_slice_num` (예: `[13, 14, 15]`) |
+
+- 슬라이스 번호는 1-based이며 원본 NIfTI의 axial 순서를 따른다.
+- 1차 표의 나머지 열은 거의 쓰지 않는다.
+- **init/fu 대응:** init 촬영은 `initial_PK`, 곧 `PKFs[0]`이다.
+  - 촬영이 3회 이상인 환자가 215명 있다. 이들의 fu 촬영은 `PKFs[1]`이 아니라 **`fu_PK`, 곧 `PKFs`의 마지막**이다.
+  - 2차 표는 이 두 촬영만 행으로 가진다. 2,516행은 1,258명 × 2회다.
+- **1차와 2차의 차이** (2026-10-30, scan 단위 실측):
+  - 양성 scan: 1차 271개 → 2차 273개. 양성 환자: 206명 → 212명.
+  - 양쪽 모두 양성인 227개 scan은 슬라이스 번호가 완전히 같다.
+  - 바뀐 것은 양성 여부뿐이다. 1차에서만 양성 44개, 2차에서만 양성 46개이고, 라벨이 바뀐 환자는 76명이다. init과 fu가 서로 바뀐 경우는 없다.
+- 2차 표에서 `fhv_slice_num`이 빈 행은 "검토했고 FHV 슬라이스 없음"이다. 표에 없는 scan은 라벨이 없는 것이며 음성이 아니다.
+- YOLO bounding box GT(`09_FHV/yolo/FHV_bbox_full_v1` 등)는 이 표와 별개다.
+
 ## 실행
 
 - 환경: conda `flair_preproc`(Python 3.10, nibabel, SimpleITK, opencv, pandas, openpyxl, matplotlib). Skull stripping의 기본 백엔드인 `native`는 같은 conda 아래의 `fhv_synthstrip` 환경(`requirements-synthstrip.txt`)이 필요하다. 처음 한 번은 Docker Desktop이 켜져 있어야 `freesurfer/synthstrip` 이미지에서 스크립트와 가중치를 복사할 수 있다. `--skullstrip-backend docker`는 amd64 이미지를 에뮬레이션으로 돌리며 약 4배 느리다.
