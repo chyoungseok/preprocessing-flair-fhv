@@ -25,7 +25,7 @@ python -m modules.pipeline \
 | 4 Orientation | nibabel 축 재배열(보간 없음) | LAS |
 | 5 Normalization | 뇌 마스크 안 voxel의 **볼륨 전체** 0.5–99.5 백분위수로 min-max, [0,1] clip, 마스크 밖 0 | `volume_brain_p05_p995` |
 | 6 Size | in-plane을 **0.41 mm/px로 리샘플링**(확대 `INTER_LINEAR`, 축소 `INTER_AREA`)한 뒤 512에 맞춤. 512보다 작으면 중앙 pad, 크면 뇌 중심 기준 crop. z축은 그대로 | `fixed_spacing_pad`, 512×512 |
-| PNG | `flipud(slice.T)`, `round(x*255)` 8-bit grayscale | `<case_id>__slice_0001.png` (1-based) |
+| PNG | `flipud(slice.T)`, `round(x*255)` 8-bit grayscale | `<case_id>_slice_0001.png` (1-based) |
 
 - **정규화:** 볼륨 전체에서 범위를 하나만 정하므로 슬라이스 사이 대비가 일정하다. 배경 0이 통계에 섞이지 않는다. 상한을 99.5%로 두어 가장 밝은 구조(FHV)가 거의 포화되지 않는다.
 - **크기:** FOV와 matrix에 관계없이 1 px이 0.41 mm다. 0.41 mm는 PAIK FOV 중앙값 210 mm ÷ 512이고, 512 px는 210 mm를 덮어 성인 뇌가 들어간다. 정사각형이 아닌 matrix도 가로세로 비율이 유지된다.
@@ -35,8 +35,8 @@ python -m modules.pipeline \
 ```
 <out-dir>/
   png/
-    positive_slices/<case_id>/<case_id>__slice_0013.png   # fhv_slice_num에 있는 슬라이스
-    negative_slices/<case_id>/<case_id>__slice_0001.png   # 같은 scan의 나머지 슬라이스
+    positive_slices/<case_id>_slice_0013.png   # fhv_slice_num에 있는 슬라이스
+    negative_slices/<case_id>_slice_0001.png   # 같은 scan의 나머지 슬라이스
     manifest.csv                                          # PNG 1장 = 1행, label 0/1
   FLAIR_nii_p/<case_id>/
     <case_id>_FLAIR_brain.nii.gz                                    # 1 SynthStrip

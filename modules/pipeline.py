@@ -6,8 +6,8 @@ brain-mask volume 0.5-99.5 percentile normalization -> in-plane resample to
 
 Output layout (``--out-dir``)::
 
-    png/positive_slices/<case_id>/<case_id>__slice_0013.png
-    png/negative_slices/<case_id>/<case_id>__slice_0001.png
+    png/positive_slices/<case_id>_slice_0013.png
+    png/negative_slices/<case_id>_slice_0001.png
     png/manifest.csv       one row per PNG, label 0/1
     FLAIR_nii_p/<case_id>/ per-step NIfTI (see STAGE_SUFFIXES), QC PNG,
                            case.json (done marker, canvas geometry)
@@ -50,7 +50,7 @@ from modules.labels import DEFAULT_LABEL_COLUMN, CaseLabel, load_label_table, ma
 
 PIPELINE_NAME = "modules.pipeline"
 # Bump when the output folder layout changes; resuming into another layout is refused.
-OUTPUT_LAYOUT = "png+FLAIR_nii_p/v1"
+OUTPUT_LAYOUT = "png+FLAIR_nii_p/v2"
 PNG_DIR = "png"
 NIFTI_DIR = "FLAIR_nii_p"
 CLASS_DIRS = {1: f"{PNG_DIR}/positive_slices", 0: f"{PNG_DIR}/negative_slices"}
@@ -198,11 +198,10 @@ def process_case(input_path: Path, label: CaseLabel, out_dir: Path, settings: di
         slice_1based = z + 1
         cls = int(slice_1based in positives)
         pixels = pp.to_png_pixels(canvas[:, :, z])
-        filename = f"{case_id}__slice_{slice_1based:04d}.png"
-        relative = Path(CLASS_DIRS[cls]) / case_id / filename
+        filename = f"{case_id}_slice_{slice_1based:04d}.png"
+        relative = Path(CLASS_DIRS[cls]) / filename
         # A label edit between runs can move a slice to the other class folder.
-        (out_dir / CLASS_DIRS[1 - cls] / case_id / filename).unlink(missing_ok=True)
-        (out_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+        (out_dir / CLASS_DIRS[1 - cls] / filename).unlink(missing_ok=True)
         if not cv2.imwrite(str(out_dir / relative), pixels, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
             raise OSError(f"failed to write {relative}")
         pixels_by_z[z] = pixels

@@ -59,7 +59,7 @@ python -m modules.pipeline ... --pid P17914 --workers 1   # 한 케이스만, �
   - 크기 맞춤은 geometry를 반환하고, `canvas_affine`이 캔버스 격자의 affine을 만든다.
 - `modules/labels.py`: 라벨 표를 `{case_id: CaseLabel}`로 읽는다(`case_id` = `id_subject_id_scan`). `match_inputs`가 입력 파일과 라벨을 연결한다.
 - **출력 구조:**
-  - PNG: `<out>/png/{positive,negative}_slices/<case_id>/<case_id>__slice_0001.png`
+  - PNG: `<out>/png/{positive,negative}_slices/<case_id>_slice_0001.png` (케이스 하위 폴더 없음)
   - manifest: `<out>/png/manifest.csv` (클래스를 합친 한 파일)
   - 단계별 NIfTI 7개, QC, `case.json`: `<out>/FLAIR_nii_p/<case_id>/`
   - NIfTI 이름은 접미사를 이어 붙인다(`_FLAIR_brain` → `_bfCorrected` → `_masked` → `_reorient` → `_norm` → `_resampled`, 그리고 `_FLAIR_brainMask`).
@@ -100,6 +100,7 @@ python -m modules.pipeline ... --pid P17914 --workers 1   # 한 케이스만, �
 - 데이터 개수와 수치는 실제 결과 파일에서 확인한다. 자료에 없는 값을 추정해서 채우지 않는다.
 - **원본 DICOM, NIfTI, GT 라벨, 기존 전처리 결과를 수정하거나 덮어쓰지 않는다.** 새 산출물은 새 경로에 저장하고, `--overwrite`는 사용자가 명시적으로 요청했을 때만 쓴다.
 - 새로 만드는 파일과 폴더 이름은 `YYYYMMDD_`로 시작한다.
+- 파일명과 폴더명에 언더바 두 개(`__`)를 연속으로 쓰지 않는다.
 - 파일 삭제, 대량 이동, 외부 볼륨(`/Volumes/One Touch`, `/Volumes/GURI_1` 등)에 쓰기 전에는 먼저 확인을 받는다. 외부 볼륨은 접근이 오래 걸리거나 멈출 수 있으므로 명령에 timeout을 둔다.
 - 영상 데이터(`*.nii`, `*.nii.gz`, `*.dcm`, `data/`, `outputs/`)는 커밋하지 않는다(`.gitignore`).
 - 데이터는 환자 단위로 분할한다. 같은 환자의 스캔이나 슬라이스가 서로 다른 split에 들어가지 않게 한다.
