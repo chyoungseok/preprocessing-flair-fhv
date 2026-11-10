@@ -57,7 +57,7 @@ python -m modules.pipeline ... --pid P17914 --workers 1   # 한 케이스만, �
 - `modules/preprocess.py`: 단계별 연산.
   - 순서: SynthStrip(native MPS 또는 Docker) → N4 → mask → 방향 정렬 → 볼륨 정규화 → 크기 맞춤 → PNG 픽셀
   - 크기 맞춤은 geometry를 반환하고, `canvas_affine`이 캔버스 격자의 affine을 만든다.
-- `tools/20261109_convert_bbox_to_preproc.py`: 파이프라인 밖의 일회성 도구. 기존 YOLO용 PNG(512로 바로 resize)에 그린 PAIK bbox(YOLO `FHV_bbox_full_v1`, CVAT `uhk100percent`)를 `case.json` geometry로 현재 PNG 좌표에 옮기고 비교 overlay를 만든다. annotation은 `PAIK_hospital/20261109_FLAIR_preproc_bbox_labels/`, overlay는 `..._bbox_qc/`에 따로 저장한다. 273 scan 중 54건만 좌표가 바뀐다.
+- `tools/20261109_convert_bbox_to_preproc.py`: 파이프라인 밖의 일회성 도구. 기존 YOLO용 PNG(512로 바로 resize)에 그린 PAIK UHK100 bbox(CVAT `FHV_bbox_full_v1_uhk100percent`)를 `case.json` geometry로 현재 PNG 좌표에 옮겨 CVAT와 YOLO txt(4클래스 그대로)로 쓰고, YOLO를 다시 읽어 비교 overlay를 만든다. annotation은 `PAIK_hospital/20261110_FLAIR_preproc_bbox_labels/`, overlay는 `..._bbox_qc/`에 따로 저장한다. 273 scan 중 54건만 좌표가 바뀐다. full_v1은 쓰지 않는다.
 - `modules/labels.py`: 라벨 표를 `{case_id: CaseLabel}`로 읽는다(`case_id` = `id_subject_id_scan`). `match_inputs`가 입력 파일과 라벨을 연결한다.
 - **출력 구조:**
   - PNG: `<out>/png/{positive,negative}_slices/<case_id>_slice_0001.png` (케이스 하위 폴더 없음)
